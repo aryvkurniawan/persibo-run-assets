@@ -1,0 +1,73 @@
+# ───────────────────────── Python ─────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ──────────────────── Model weights (large) ───────────────────
+# Distributed via GitHub Releases — see README → "Model weights".
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+
+# ───────────────────── Media / data (large) ──────────────────
+*.mp4
+*.webm
+*.avi
+*.mov
+*.mkv
+*.7z
+*.zip
+
+# ─────────────────── Generated pipeline outputs ──────────────
+# All run artifacts are reproducible from the pipeline.
+outputs/
+runs/
+data/
+
+# Keep curated sample reports & thesis figures (tracked explicitly)
+!docs/sample_outputs/
+!thesis_figures/**/*.png
+
+# ───────────────────────── Logs ──────────────────────────────
+*.log
+logs/
+
+# ─────────────────────── Tooling caches ──────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ───────────────────────── Test artifacts ────────────────────
+testphotos.png
+
+# ───────────────────────── OS / editor ───────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local scratch: throwaway analysis / benchmark scripts
+.scratch/
+.bin/
+
+# Agent skills (Roboflow CV skills, installed via npx)
+.agents/skills/
+.omp/skills/
+.claude/skills/
+skills-lock.json

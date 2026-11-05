@@ -1,0 +1,345 @@
+# =====================================================================
+# football_ai — Phase 1 (Detection) configuration
+# =====================================================================
+
+model:
+  # H250 = SoccerNet v3 long-shot subset (player box height <= 250 px),
+  # trained yolo11s @960 on Kaggle T4: person mAP50 0.986.
+  # Measure on the persika probe: 9.0 players/frame median (vs mikolaj 5.0,
+  # best.onnx 3.0). 2 classes only: ball + person; all people become "player".
+  weights_path: "weights/h250_yolo11s.onnx" # DirectML path; .pt falls back to CPU
+  device: "auto"                    # "auto" | "cpu" | "cuda:0"
+  confidence_threshold: 0.35        # global confidence threshold
+  iou_threshold: 0.50               # NMS IoU threshold
+  # Inference resolution (long side). 960 is 1.9x faster than 1280 on DirectML
+  # for 0.2 players/frame lost at real 1080p -- see docs/WORKFLOW.md.
+  # The exported .onnx has a STATIC input shape: changing this requires
+  # re-exporting the weights at the matching size.
+  image_size: 960
+  # Per-class confidence overrides. The ball is small and hard to
+  # detect, so it usually needs a lower threshold than players.
+  class_confidence_overrides:
+    ball: 0.20        # small, fast object; below this you get false positives
+    player: 0.35      # keep low: H250 person boxes land 0.2-0.9 on wide shots
+    goalkeeper: 0.35  # folded into person
+    referee: 0.35     # folded into person
+
+# Class index -> name mapping of the custom-trained model.
+classes:
+  0: "ball"
+  1: "player"
+
+
+video:
+  output_dir: "outputs"
+  save_video: true
+  output_codec: "mp4v"              # fourcc code for the output video
+
+visualization:
+  box_thickness: 2
+  font_scale: 0.5
+  show_confidence: true
+  # BGR colors per class (OpenCV uses BGR, not RGB).
+  colors:
+    ball:       [0, 255, 255]       # yellow
+    goalkeeper: [0, 0, 255]         # red
+    player:     [255, 0, 0]         # blue
+    referee:    [0, 255, 0]         # green
+
+debug:
+  enabled: false                    # master switch for visual debugging
+  show_window: false                # live cv2.imshow window ('q' quits)
+  save_debug_frames: false          # dump annotated frames as images
+  debug_frame_interval: 50          # save every Nth frame
+
+logging:
+  level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
+  log_dir: "outputs/logs"
+  log_to_file: true
+
+# =====================================================================
+# Phase 2 — Tracking (BoT-SORT)
+# =====================================================================
+# Detection runs exactly as before; tracking is an extra stage layered
+# on top. Enable it with `enabled: true` or the --tracking CLI flag.
+tracking:
+  enabled: false
+  tracker_type: "botsort"           # "botsort" (preferred) | "bytetrack"
+  separate_ball: true               # track the ball with its own tracker
+  ball_class_name: "ball"
+  # Appearance ReID. `reid_model: "auto"` is the ONLY unsupported value here
+  # (it means "reuse the detector's backbone features", which exist only on
+  # Ultralytics' model.track() path). Any real checkpoint works: Ultralytics'
+  # ReID encoder crops from the frame we already pass to update(), so no
+  # detector hook is involved -- verified to yield 256-d embeddings here.
+  # This is what separates two TEAMMATES in identical kits; motion + IoU
+  # alone cannot, and that is where most ID switches come from.
+  # OFF deliberately. yolo11n-cls.pt is an ImageNet *classifier*, not a person
+  # re-identification encoder: its embeddings say what kind of object is in the
+  # crop, not which player, so for teammates in identical kits it is close to
+  # noise. Measured on clasico_clip it made identity worse (53 -> 111 ids,
+  # 12 -> 47 switches) and cost roughly 5x in speed. Turn this back on only
+  # with a real ReID checkpoint (OSNet or similar), and re-measure.
+  with_reid: false
+  reid_model: "weights/yolo11n-cls.pt"   # unused while with_reid is false
+
+  # Hand the tracker the boxes that FAILED the per-class display thresholds.
+  # BoT-SORT associates in two passes and the second is over low-score boxes:
+  # that pass is what carries an id through a partial occlusion. Filtering at
+  # `player: 0.50` before the tracker left it with nothing to match, so a
+  # player whose score dipped for a few frames lost their track and returned
+  # as a NEW id. Measured here, dropouts -- not association errors -- caused
+  # essentially every id switch. Weak boxes are never exported or drawn, and
+  # `new_track_thresh` stops them spawning tracks of their own.
+  feed_weak_detections: true
+  save_tracks: true
+
+  # Main tracker: player / goalkeeper / referee.
+  main:
+    # 0.50 -> 0.35 on the iLeague-TV wide camera: player boxes there sit
+    # 0.25-0.50 and were being discarded before association. new_track_thresh
+    # stays at 0.60 so the looser first pass cannot mint its own ids.
+    track_high_thresh: 0.35         # 1st association pass: confident boxes
+    track_low_thresh: 0.10          # 2nd pass: weak boxes, to hold ids through dips
+    # A NEW id is only minted above this. At the old 0.25 the weak boxes were
+    # spawning tracks of their own instead of continuing existing ones, which is
+    # what fragmented identities -- essentially every id switch on these clips
+    # was a dropout followed by a new id, not the tracker confusing two players.
+    # Measured over 400 frames on three clips, 0.25 -> 0.60:
+    #   clasico_clip   53 -> 39 ids,  12 -> 3 switches,  coverage -1.2 pp
+    #   match3         68 -> 42 ids,  28 -> 8 switches,  coverage -1.9 pp
+    #   input_video2   33 -> 26 ids,   4 -> 1 switches,  coverage -0.7 pp
+    # 0.65 buys a few more on match3 but costs another ~1 pp of coverage and
+    # ties on the other two, so 0.60 is the better general default.
+    new_track_thresh: 0.60
+    track_buffer: 30                # frames a lost track survives
+    match_thresh: 0.80
+    fuse_score: true
+    gmc_method: "sparseOptFlow"     # camera-motion compensation
+    proximity_thresh: 0.50
+    appearance_thresh: 0.80
+
+  # Ball tracker (BoT-SORT): only used as a FALLBACK when
+  # ball_tracking.enabled is false. Lower thresholds + longer buffer.
+  ball:
+    track_high_thresh: 0.10
+    track_low_thresh: 0.05
+    new_track_thresh: 0.10
+    track_buffer: 60
+    match_thresh: 0.80
+    fuse_score: false               # ball conf is low; fusing breaks re-association
+    gmc_method: "sparseOptFlow"
+    proximity_thresh: 0.50
+    appearance_thresh: 0.80
+
+  # Custom ball association (preferred). The ball is ~6-7 px wide but moves
+  # ~8-9 px/frame, so consecutive boxes have zero IoU and BoT-SORT can't
+  # link them. This tracker inflates the ball box FOR MATCHING ONLY and
+  # falls back to center-distance + velocity prediction when IoU is zero.
+  # The exported/visualized bbox is always the true (un-inflated) box.
+  ball_tracking:
+    enabled: true
+    matching_box_scale: 3.0         # inflate ball box x3 for matching
+    min_box_size: 20.0              # floor (px) for the inflated matching box
+    max_frame_gap: 30               # frames a ball track may coast unmatched
+    distance_gate_px: 50.0          # max center distance for a zero-IoU match
+
+  # Post-tracking ID stitching: re-link a new id to an old one when it
+  # appears near where the old track disappeared (reduces ID switches).
+  # Pure post-process; the BoT-SORT tracker itself is untouched.
+  # Enable with `enabled: true` or the --stitch-tracks CLI flag.
+  stitching:
+    # On by default: it re-links ids across gaps longer than the tracker can
+    # bridge, which is the largest remaining bucket of switches (track_buffer
+    # provably cannot reach them -- after a long gap the Kalman box has drifted
+    # and IoU is ~0).
+    #
+    # The gates are wider than they look because they have a specific job:
+    # `new_track_thresh` (0.60) deliberately refuses to start a track from a
+    # low-confidence box, which protects against spurious ids -- but a distant,
+    # partly-occluded player detected at 0.52 then goes UNTRACKED until his
+    # confidence recovers. Traced on Tesr1: a player was detected continuously
+    # at 0.50-0.56 for 13 frames while the tracker held no id for him, then
+    # reappeared as a new id. Stitching is what repairs those holes.
+    #
+    # Measured on Tesr1 (ids born mid-pitch, i.e. the tracker losing somebody
+    # rather than a player walking into shot):
+    #   no stitching   31      gap 45/120   13      gap 75/180    9
+    #   gap 120/250     5  but it also welds two different players together
+    #   (a track that covered 241 px in 9 frames -- 2.4x a human sprint).
+    # 75/180 is the widest setting that gained ground without inventing a link.
+    enabled: true
+    max_frame_gap: 75               # frames a track may vanish before re-link
+    distance_gate_px: 180.0         # max gap between predicted & new position
+    size_ratio_gate: 1.8            # bbox size compatibility (max ratio)
+    match_same_class: true          # only stitch tracks of the same class
+    min_segment_length: 8           # drop noise tracks shorter than this (ball kept)
+
+  # Appearance ID-swap correction: fixes the case stitching CAN'T — two
+  # players crossing and EXCHANGING ids. Detected from jersey color (a track
+  # that flips team mid-way) and undone from the crossing frame onward.
+  # Enable with `enabled: true` or the --fix-swaps CLI flag.
+  swap_correction:
+    enabled: false
+    samples_per_track: 40           # appearance samples per track (temporal)
+    min_track_length: 30            # only consider reasonably long tracks
+    frame_tol: 25                   # max frame gap between the paired flips
+    distance_gate_px: 220.0         # how close the two tracks must cross
+    min_purity: 0.8                 # how clean the before/after split must be
+    # Where the exchange is made. Appearance says THAT two tracks were
+    # swapped but not WHEN: a jersey only reads as the other team once the
+    # players have drawn apart again, tens of frames after the boxes were
+    # handed over. Cutting there made each repaired track teleport across
+    # that gap -- measured on Tesr1, the worst step went from 13 px/frame to
+    # 376, i.e. players flung across the pitch. The window is instead nudged
+    # to the cheapest join nearby, which is the crossing itself; that put the
+    # worst step back to 37. Edges that sit at the very start or end of both
+    # tracks are left alone -- there is no crossing there to align to.
+    edge_refine_frames: 45
+
+  # Fixed squad numbers. Instead of letting the tracker mint ids until it runs
+  # out of confidence -- 27 of them for 22 people on Tesr1 -- the ids exist
+  # first: 1..11 for one team, 12..22 for the other, 0 for the ball. Every
+  # track is placed in one of them or in none, so an id means a person for the
+  # whole clip and running out is visible rather than silent.
+  #
+  # Measured on Tesr1 before choosing these numbers:
+  #   * players on screen at once: min 19, median 22, max 24 -- so 11 a side
+  #     is right, and the occasional 23rd/24th box is a false positive that
+  #     SHOULD be refused a number rather than given one.
+  #   * two goalkeepers were never both visible, in any of 1471 frames; the
+  #     broadcast frame does not reach both goals. So the keeper is one of the
+  #     eleven, not a separate slot.
+  #   * the longest a real track vanished for was 49 frames (2.0 s), and 99%
+  #     of gaps were under that. A 30 s rule would never fire; 75 frames (3 s)
+  #     is twice the worst gap seen and still short enough that a number is
+  #     freed while the clip is running.
+  #
+  # What this CANNOT do: colour separates the two kits, not the eleven players
+  # inside one. Two team-mates can still exchange numbers and nothing here
+  # will notice -- at this camera distance a shirt number is about 8 px tall.
+  roster:
+    enabled: true
+    slots_per_team: 11
+    max_gap_frames: 75              # a number is freed after this long unworn
+    distance_gate_px: 250.0         # how far a returning player may reappear
+    unnumbered_classes: ["referee"] # not part of either squad
+    pitch_sample_every: 5           # project every Nth frame to metres
+    # A goalkeeper is found two ways, because one is not enough. The absolute
+    # test -- standing in front of a goal -- missed Barcelona's keeper on
+    # Tesr1 twice over: he played a high line at 27-31 m, and the camera never
+    # showed anything closer than 27 m to that goal, so the 22 m box the test
+    # checks was never on screen. The relative test has neither weakness: he
+    # is behind his own outfield whatever the camera does. It needs the
+    # lateral gate beside it, because an assistant referee beyond the last
+    # defender scores 100% on it too (measured), and so does the odd full-back
+    # -- a keeper sits on the midline and neither of them does.
+
+# =====================================================================
+# Phase 3 — Track-level Role Refinement
+# =====================================================================
+# Runs AFTER tracking. Corrects each track's role adaptively per match:
+# it discovers the two main team appearance clusters from the tracked
+# players, flags appearance outliers, and separates referee vs goalkeeper
+# using track-level appearance, image-space position and motion — with
+# temporal voting so no role flips on a single frame. NO fixed color
+# rules (no "black = referee", no "green = goalkeeper").
+role_refinement:
+  enabled: false
+  min_track_length: 15              # frames a track must span to be "stable"
+  samples_per_track: 20             # frames sampled per track for appearance
+  jersey_crop_top: 0.15             # top of jersey region (fraction of bbox h)
+  jersey_crop_bottom: 0.55          # bottom of jersey region (fraction of bbox h)
+  jersey_crop_side: 0.15            # trim this fraction off each side (arms/bg)
+  team_cluster_count: 2             # number of team appearance clusters
+  outlier_distance_threshold: 0.35  # cosine distance beyond which = outlier
+  temporal_vote_threshold: 0.70     # min winning vote fraction to commit a role
+  unknown_if_low_confidence: true   # below the vote threshold -> "unknown"
+  # Detector referee prior: keep a detector "referee" as referee when
+  # refinement flipped it to "player" with confidence below the override
+  # bar (assistant referees often resemble one team's kit).
+  referee_detector_prior_enabled: true
+  referee_to_player_override_confidence: 0.90
+  ball_class_name: "ball"
+  save_roles: true
+  save_role_video: false            # render an annotated role video
+  random_seed: 42                   # determinism for clustering
+
+# =====================================================================
+# Phase 3.5 — Human-in-the-Loop Role Correction
+# =====================================================================
+# Runs AFTER role refinement. Surfaces ONLY ambiguous tracks (role
+# "unknown" or low confidence) for manual review in a Streamlit UI, stores
+# the reviewer's choices separately, and overlays them on the automatic
+# results to produce a final roles JSON. Automatic results are never
+# overwritten and corrections are reversible (delete the entry to revert).
+manual_correction:
+  enabled: false
+  review_confidence_threshold: 0.65   # roles below this become review candidates
+  review_roles: ["unknown"]           # roles always reviewed regardless of conf
+  representative_frames: 9             # frames sampled per track for review (catch ID switches)
+  corrections_file: "outputs/manual_role_corrections.json"
+  review_dir: "outputs/manual_review"
+  save_review_frames: true            # also save full frames (not just crops)
+  save_final_video: false             # render the final annotated role video
+  # User-guided initialization: label boxes in a few frames as seeds.
+  initialization_labels_file: "outputs/manual_initialization_labels.json"
+  autosave: false                     # UI: save automatically after each edit
+
+# =====================================================================
+# Phase 4 — Pitch calibration (manual file OR automatic keypoint model)
+# =====================================================================
+# `auto: true` (or --auto-calibration) computes the homography per frame
+# from a YOLO-pose pitch-keypoint model — no manual clicking, follows the
+# camera. Falls back to the manual pitch_calibration.json when auto is off.
+calibration:
+  auto: false
+  # The .onnx export runs on DirectML (GPU). The .pt next to it loads through
+  # Ultralytics' CPU provider -- measured 0.8 fps vs 6.1 fps on the RX 580,
+  # and 0 valid keypoints on the same frames. Keep this pointing at .onnx.
+  keypoint_model: "weights/pitch_keypoints_yolo11m_best.pt.onnx"
+  keypoint_sample_every: 5            # calibrate every Nth frame
+  keypoint_min_points: 5              # min keypoints to solve a frame
+  keypoint_min_conf: 0.5             # per-keypoint confidence gate
+  keypoint_max_error_m: 4.0          # reject frames above this reproj error
+  # 0 = keep every anchor. The 8-anchor cap assumes a camera bolted in place;
+  # this footage is cut between fixed cameras, so one homography per half is
+  # wrong after each cut.
+  keypoint_max_anchors: 0
+  # Camera-motion smoothing costs ~3.5 h per half (full-res LK on every
+  # frame) and the anchors are already every ~20 frames on a fixed camera,
+  # so the nearest-anchor homography is used instead.
+  camera_motion: false
+  px_per_meter: 8.0
+  reprojection_warn_threshold: 5.0
+
+# =====================================================================
+# Phase 4 — Minimap dot coloring
+# =====================================================================
+# Analytics view colors dots by team/role (player team 0 = blue, team 1 =
+# orange, goalkeeper = red, referee = yellow, ball = white, unknown =
+# gray). Per-track colors are for DEBUGGING only (--minimap-color-mode
+# track_id). Roles come from <video>_roles_final.json when corrections are
+# applied, else <video>_roles.json.
+minimap:
+  color_mode: "team_role"             # team_role (default) | track_id (debug)
+  show_track_ids: false               # draw the track id INSIDE each dot
+  px_per_meter: 9.0                   # minimap resolution (bigger = sharper)
+  player_dot_radius: 9                # bigger = more visible players
+  ball_dot_radius: 6
+  stripes: 12                         # mown-stripe count (0 = flat green)
+
+# =====================================================================
+# Phase 4 — Minimap overlay (picture-in-picture inside the main video)
+# =====================================================================
+# When enabled (--minimap-overlay, which also turns on --save-minimap),
+# the top-down minimap is composited into the main annotated video,
+# producing outputs/<video>_final_with_minimap.mp4. Needs --calibration;
+# skipped safely with a warning if calibration is missing.
+minimap_overlay:
+  enabled: false
+  position: "top_right"               # top_right | top_left | bottom_right | bottom_left
+  width_ratio: 0.28                   # overlay width as a fraction of video width
+  margin: 20                          # px from the frame edge
+  background_alpha: 0.65              # darkness of the backing panel (0..1)
+  border: true                        # thin white border around the minimap
